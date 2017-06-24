@@ -6,6 +6,7 @@ import pickle
 import matplotlib.pyplot as plt
 import pylab as pylab
 import os
+import collections
 
 #imageio.plugins.ffmpeg.download()
 
@@ -21,6 +22,10 @@ imgShape = (1280, 720)
 frameCount = 0
 #max. pixel difference in first x position of line between frames
 lineBaseXDiff_Threshold = 100
+#max pixel difference in top x position of line between 2 frames
+lineTopXDiff_Threshold = 110
+#max pixel difference in top x position of line between 2 frames
+topPositionDiff_Threshold = 60
 
 # window settings
 window_width = 50 
@@ -31,6 +36,8 @@ ym_per_pix = 30/720 # meters per pixel in y dimension
 xm_per_pix = 3.7/700 # meteres per pixel in x dimension
 
 ploty = np.linspace(0, imgShape[0], 101 )
+polygon_old = None
+lane_width_bird = None
 
 # load pickled distortion matrix
 with open('camera_coefficients.p', mode='rb') as f:
@@ -70,28 +77,47 @@ class Line():
         #polynomial coefficients averaged over the last n iterations
         self.best_fit = None  
         #polynomial coefficients for the most recent fit
-        self.current_fit = [np.array([False])]  
+        self.current_fit = collections.deque(maxlen = 5) #[np.array([False])]  
         #radius of curvature of the line in some units
         self.radius_of_curvature = None 
         #distance in meters of vehicle center from the line
         self.line_base_pos = None 
         #difference in fit coefficients between last and new fits
         self.diffs = np.array([0,0,0], dtype='float') 
-        #x values for detected line pixels
-        self.allx = None  
-        #y values for detected line pixels
-        self.ally = None
         #1st x position of the line in birdview image
         self.baseXCenter = -1
-        
+        self.topXCenter = -1
+    
+    def updateCoefficients(self, newCoeff):        
+        self.current_fit.append(newCoeff)
+        self.best_fit = np.average(self.current_fit, axis=0)
+        return self.best_fit
+       
     def updateBasePosition(self, newCenter):
         if self.baseXCenter != -1:
-            if np.absolute(self.baseXCenter-newCenter) < lineBaseXDiff_Threshold:
+            if np.abs(self.baseXCenter-newCenter) < lineBaseXDiff_Threshold:
                 self.baseXCenter = newCenter
         else:
             self.baseXCenter = newCenter
             
         return self.baseXCenter       
+
+    def updateTopPosition(self, newCenter):
+        if self.topXCenter != -1:
+            if np.abs(self.topXCenter-newCenter) < lineTopXDiff_Threshold:
+                self.topXCenter = newCenter
+        else:
+            self.topXCenter = newCenter
+            
+        return self.topXCenter       
+
+    def updateFitX(self, newFitx):
+        self.bestx = newFitx
+        return self.bestx
+        
+    def updateCurvature(self, newCurvature):
+        self.radius_of_curvature = newCurvature
+        return self.radius_of_curvature
 
 #undistort input img and return result
 #store the 2 images to file if needed
@@ -239,6 +265,7 @@ def window_mask(width, height, img_ref, center,level):
     return output
 
 def find_window_centroids(image, window_width, window_height, margin, leftL, rightL):
+    global lane_width_bird
     
     window_centroids = [] # Store the (left,right) window centroid positions per level
     window = np.ones(window_width) # Create our window template that we will use for convolutions
@@ -256,7 +283,7 @@ def find_window_centroids(image, window_width, window_height, margin, leftL, rig
     r_center = np.argmax(np.convolve(window,r_sum))-window_width/2+int(image.shape[1]/2)
     
     l_center = leftL.updateBasePosition(l_center)
-    r_center = rightL.updateBasePosition(r_center)
+    r_center = rightL.updateBasePosition(r_center)      
     
     # Add what we found for the first layer
     window_centroids.append((l_center,r_center))
@@ -264,37 +291,45 @@ def find_window_centroids(image, window_width, window_height, margin, leftL, rig
     # Go through each layer looking for max pixel locations
     for level in range(1,(int)(image.shape[0]/window_height)):
 	    # convolve the window into the vertical slice of the image
-	    image_layer = np.sum(image[int(image.shape[0]-(level+1)*window_height):int(image.shape[0]-level*window_height),:], axis=0)
-	    conv_signal = np.convolve(window, image_layer)
+        image_layer = np.sum(image[int(image.shape[0]-(level+1)*window_height):int(image.shape[0]-level*window_height),:], axis=0)
+        conv_signal = np.convolve(window, image_layer)
 	    # Find the best left centroid by using past left center as a reference
 	    # Use window_width/2 as offset because convolution signal reference is at right side of window, not center of window
-	    offset = window_width/2
-	    l_min_index = int(max(l_center+offset-margin,0))
-	    l_max_index = int(min(l_center+offset+margin,image.shape[1]))
-	    new_l_center = np.argmax(conv_signal[l_min_index:l_max_index])+l_min_index-offset
-	    if np.absolute(new_l_center - l_center) < window_width*1.5 :
-	        l_center = new_l_center
-	    #print  ('[', level, '] l_center= ', l_center, 'min/max= ', l_min_index, ', ', l_max_index)
+        offset = window_width/2
+        l_min_index = int(max(l_center+offset-margin,0))
+        l_max_index = int(min(l_center+offset+margin,image.shape[1]))
+        new_l_center = np.argmax(conv_signal[l_min_index:l_max_index])+l_min_index-offset
+        if np.absolute(new_l_center - l_center) < window_width*1.5 :
+            l_center = new_l_center
+#print  ('[', level, '] l_center= ', l_center, 'min/max= ', l_min_index, ', ', l_max_index)
 	    
-	    # Find the best right centroid by using past right center as a reference
-	    r_min_index = int(max(r_center+offset-margin,0))
-	    r_max_index = int(min(r_center+offset+margin,image.shape[1]))
-	    new_r_center = np.argmax(conv_signal[r_min_index:r_max_index])+r_min_index-offset
-	    if np.absolute(new_r_center - r_center) < window_width*1.5 :
-	        r_center = new_r_center
+        # Find the best right centroid by using past right center as a reference
+        r_min_index = int(max(r_center+offset-margin,0))
+        r_max_index = int(min(r_center+offset+margin,image.shape[1]))
+        new_r_center = np.argmax(conv_signal[r_min_index:r_max_index])+r_min_index-offset
+        if np.absolute(new_r_center - r_center) < window_width*1.6 :
+            r_center = new_r_center
+
+        #top position
+        if (level+1) >= (int)(image.shape[0]/window_height): 
+            #print ("level=", level)
+            l_center = leftL.updateTopPosition(l_center)
+            r_center = rightL.updateTopPosition(r_center)
+
 	    # Add what we found for that layer
-	    window_centroids.append((l_center,r_center))
+        window_centroids.append((l_center,r_center))
 
     return window_centroids
 
 def calculateCurvature(fit, ploty):    
-    y_eval = np.max(ploty)
-    curve = ((1 + (2*fit[0]*y_eval + fit[1])**2)**1.5) / np.absolute(2*fit[0])
+    y_eval = np.max(ploty)/2
+    curve = ((1 + (2*fit[0]*y_eval*ym_per_pix + fit[1])**2)**1.5) / np.absolute(2*fit[0])
     return curve
 
 #Process each image in the input video clip
 def processImage(image):
     global frameCount
+    global polygon_old
     frameCount = frameCount + 1
     
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
@@ -311,11 +346,18 @@ def processImage(image):
     right_xvals = [i[1] for i in centroids]
     right_pixel_fit = np.polyfit(yvals, right_xvals, 2)
     right_fit = np.polyfit([i * ym_per_pix for i in yvals], [i * xm_per_pix for i in right_xvals], 2)
-    #print ('left_fit=', left_fit, 'right_fit=', right_fit)
-
+           
     #calculate curvature
     left_curvature = calculateCurvature(left_fit, yvals)
     right_curvature = calculateCurvature(right_fit, yvals)
+    #print ("curve=", left_curvature, ", ", right_curvature)
+
+    if right_curvature > 180:
+        right_pixel_fit = right_lane.updateCoefficients(right_pixel_fit)
+    else:
+        right_pixel_fit = right_lane.best_fit        
+    left_pixel_fit = left_lane.updateCoefficients(left_pixel_fit)
+    #print ('left_fit=', left_pixel_fit, 'right_fit=', right_pixel_fit)
     
     #draw the detected lane onto original road image
     # Create an image to draw the lines on
@@ -348,11 +390,28 @@ def processImage(image):
         #Draw the fitted polynomial curve
         left_fitx = left_pixel_fit[0]*ploty**2 + left_pixel_fit[1]*ploty + left_pixel_fit[2]
         right_fitx = right_pixel_fit[0]*ploty**2 + right_pixel_fit[1]*ploty + right_pixel_fit[2]
+        
+        right_lane.updateFitX(right_fitx)
+        left_lane.updateFitX(left_fitx)
+    
+    right_fitx = right_lane.bestx
+    left_fitx = left_lane.bestx
     
     # Recast the x and y points into usable format for cv2.fillPoly()
     pts_left = np.array([np.transpose(np.vstack([left_fitx, ploty]))])
     pts_right = np.array([np.flipud(np.transpose(np.vstack([right_fitx, ploty])))])
     pts = np.hstack((pts_left, pts_right))
+
+    #Check resulting polygon with those from previous frame
+    #if (polygon_old == None):
+    #    polygon_old = pts
+        
+    #oldPoly = polygon_old
+    #newPoly = pts
+    #ret = cv2.matchShapes(np.array(np.int_(oldPoly)),np.array(np.int_(newPoly)),1,0.0)    
+    #if (ret < 0.09):
+    #    # Use the new polygon points to write the next frame due to similarities of last successfully written polygon area    
+    #    polygon_old = newPoly    
     
     # Draw the lane onto the warped blank image
     cv2.fillPoly(color_warp, np.int_([pts]), (0,255, 0))
@@ -376,7 +435,7 @@ def processImage(image):
     cv2.putText(result, str2, (50, 80), font, 1, (255, 255, 255), 2)
     cv2.putText(result, str3, (50, 110), font, 1, (255, 255, 255), 2)
     
-    if off_center > 1.0:
+    if (off_center > 0.6) or (off_center < -0.6):
         f, ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(2, 3, figsize=(16, 10))
         f.tight_layout()
         ax1.imshow(undistorted)
